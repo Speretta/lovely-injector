@@ -1,9 +1,13 @@
-use regex_cursor::{Input, IntoCursor};
+use regex_cursor::Input;
 use regex_cursor::engines::meta::Regex;
+use regex_cursor::regex_automata::util::syntax;
 use regex_cursor::regex_automata::util::interpolate;
 
-use ropey::Rope;
+use itertools::Itertools;
+use crop::Rope;
 use serde::{Serialize, Deserialize};
+
+use crate::chunk_vec_cursor::IntoCursor;
 
 use super::InsertPosition;
 
@@ -29,6 +33,13 @@ pub struct RegexPatch {
     // This value defaults to an empty string.
     #[serde(default)]
     pub line_prepend: String,
+
+    // Apply patch at most `times` times, warn if the number of matches differs from `times`.
+    pub times: Option<usize>,
+
+    // If enabled, whitespace is ignored unless escaped
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 impl RegexPatch {
@@ -38,13 +49,40 @@ impl RegexPatch {
         }
 
         let input = Input::new(rope.into_cursor());
-        let re = Regex::new(&self.pattern)
-            .unwrap_or_else(|e| panic!("Failed to compile Regex pattern '{}': {e:?}", self.pattern));
+        let re = Regex::builder()
+            .syntax(
+                 syntax::Config::new()
+                    .multi_line(true)
+                    .crlf(true)
+                    .ignore_whitespace(self.verbose)
+            )
+            .build(&self.pattern)
+            .unwrap_or_else(|e| panic!("Failed to compile Regex '{}': {e:?}", self.pattern));
 
-        let captures = re.captures_iter(input).collect::<Vec<_>>();
+        let mut captures = re.captures_iter(input).collect_vec();
         if captures.is_empty() {
-            log::info!("Regex query '{}' on target '{target}' did not result in any matches", self.pattern);
+            log::warn!("Regex '{}' on target '{target}' resulted in no matches", self.pattern.escape_debug());
             return false;
+        }
+        if let Some(times) = self.times {
+            fn warn_regex_mismatch(pattern: &str, target: &str, found_matches: usize, wanted_matches: usize) {
+                let warn_msg: String = if pattern.lines().count() > 1 {
+                    format!("Regex '''\n{pattern}''' on target '{target}' resulted in {found_matches} matches, wanted {wanted_matches}" )
+                } else {
+                    format!("Regex '{pattern}' on target '{target}' resulted in {found_matches} matches, wanted {wanted_matches}")
+                };
+                for line in warn_msg.lines() {
+                    log::warn!("{}", line)
+                }
+            }
+            if captures.len() < times {
+                warn_regex_mismatch(&self.pattern, target, captures.len(), times);
+            }
+            if captures.len() > times {
+                warn_regex_mismatch(&self.pattern, target, captures.len(), times);
+                log::warn!("Ignoring excess matches");
+                captures.truncate(times);
+            }
         }
 
         // This is our running byte offset. We use this to ensure that byte references
@@ -57,7 +95,7 @@ impl RegexPatch {
             let base_start = (base.start as isize + delta) as usize;
             let base_end = (base.end as isize + delta) as usize;
 
-            let base_str = rope.get_byte_slice(base_start..base_end).unwrap().to_string();
+            let base_str = rope.byte_slice(base_start..base_end).to_string();
 
             // Interpolate capture groups into self.line_prepend, if any capture groups exist within.
             let mut line_prepend = String::new();
@@ -68,7 +106,7 @@ impl RegexPatch {
                     let start = (span.start as isize + delta) as usize;
                     let end = (span.end as isize + delta) as usize;
 
-                    let rope_slice = rope.get_byte_slice(start..end).unwrap();
+                    let rope_slice = rope.byte_slice(start..end);
 
                     dest.push_str(&rope_slice.to_string());
                 },
@@ -77,40 +115,6 @@ impl RegexPatch {
                     groups.group_info().to_index(pid, name)
                 },
                 &mut line_prepend
-            );
-
-            // Prepend each line of the payload with line_prepend.
-            let new_payload = self
-                .payload
-                .lines()
-                .map(|x| if !x.is_empty() {
-                    format!("{line_prepend}{x}")
-                } else {
-                    x.to_string()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            // Interpolate capture groups into the payload.
-            // We must use this method instead of Captures::interpolate_string because that
-            // implementation seems to be broken when working with ropes.
-            let mut payload = String::new();
-            interpolate::string(
-                &new_payload,
-                |index, dest| {
-                    let span = groups.get_group(index).unwrap();
-                    let start = (span.start as isize + delta) as usize;
-                    let end = (span.end as isize + delta) as usize;
-
-                    let rope_slice = rope.get_byte_slice(start..end).unwrap();
-
-                    dest.push_str(&rope_slice.to_string());
-                },
-                |name| {
-                    let pid = groups.pattern().unwrap();
-                    groups.group_info().to_index(pid, name)
-                },
-                &mut payload
             );
 
             // Cleanup and convert the specified root capture to a span.
@@ -124,39 +128,106 @@ impl RegexPatch {
                 if let Ok(idx) = group_name.parse::<usize>() {
                     groups.get_group(idx)
                         .unwrap_or_else(|| 
-                            panic!("The capture group at index {idx} could not be found in '{base_str}' with the Regex pattern '{}'", self.pattern))
+                            panic!("The capture group at index {idx} could not be found in '{base_str}' with the Regex '{}'", self.pattern))
                 } else {
                     groups.get_group_by_name(&group_name)
                         .unwrap_or_else(|| 
-                            panic!("The capture group with name '{group_name}' could not be found in '{base_str}' with the Regex pattern '{}'", self.pattern))
+                            panic!("The capture group with name '{group_name}' could not be found in '{base_str}' with the Regex '{}'", self.pattern))
                 }
             };
 
             let target_start = (target_group.start as isize + delta) as usize;
             let target_end = (target_group.end as isize + delta) as usize;
 
-            let char_start = rope.byte_to_char(target_start);
-            let char_end = rope.byte_to_char(target_end);
+            let mut new_payload = std::format!("{}", 
+                self
+                    .payload
+                    .split_inclusive('\n')
+                    .format_with("", |x, f| f(&format_args!("{}{}", line_prepend, x)))
+            );
 
-            match self.position {
-                InsertPosition::Before => {
-                    rope.insert(char_start - 1, &payload);
-                }
-                InsertPosition::After => {
-                    rope.insert(char_end, &payload);
-                }
-                InsertPosition::At => {
-                    rope.remove(char_start..char_end);
-                    rope.insert(char_start, &payload);
+
+
+            // Interpolate capture groups into the payload.
+            // We must use this method instead of Captures::interpolate_string because that
+            // implementation seems to be broken when working with ropes.
+            let mut payload = String::new();
+
+            interpolate::string(
+                &new_payload,
+                |index, dest| {
+                    let span = groups.get_group(index).unwrap();
+                    let start = (span.start as isize + delta) as usize;
+                    let end = (span.end as isize + delta) as usize;
+
+                    let rope_slice = rope.byte_slice(start..end);
+
+                    dest.push_str(&rope_slice.to_string());
+                },
+                |name| {
+                    let pid = groups.pattern().unwrap();
+                    groups.group_info().to_index(pid, name)
+                },
+                &mut payload
+            );
+
+            // If left border of insertion is a wordchar -> non-wordchar 
+            // boundary and our patch starts with a wordchar, prepend space so 
+            // it doesn't unintentionally concatenate with characters to its 
+            // left to create a larger identifier.
+            if payload.starts_with(|x: char| x.is_ascii_alphanumeric() || x == '_') {
+                let pre_pt = if let InsertPosition::After = self.position {
+                    target_end
+                } else {
+                    target_start
+                };
+                if pre_pt > 0 {
+                    let byte_on_left = rope.byte(pre_pt - 1);
+                    if byte_on_left.is_ascii_alphanumeric() || byte_on_left == b'_' {
+                        payload.insert(0, ' ');
+                    }
                 }
             }
 
-            let new_len = payload.len();
-            let old_len = target_group.end - target_group.start;
+            // If right border of insertion is a non-wordchar -> wordchar 
+            // boundary and our patch ends with a wordchar, append space so 
+            // it doesn't unintentionally concatenate with characters to its 
+            // right to create a larger identifier.     
+            if payload.ends_with(|x: char| x.is_ascii_alphanumeric() || x == '_') {
+                let post_pt = if let InsertPosition::Before = self.position {
+                    target_start
+                } else {
+                    target_end
+                };
+                if post_pt < rope.byte_len() {
+                    let byte_on_right = rope.byte(post_pt);
+                    if byte_on_right.is_ascii_alphanumeric() || byte_on_right == b'_' {
+                        payload.push(' ');
+                    }
+                }
+            }
 
-            delta += new_len as isize - old_len as isize;
+            match self.position {
+                InsertPosition::Before => {
+                    rope.insert(target_start, &payload);
+                    let new_len = payload.len();
+                    delta += new_len as isize;
+                }
+                InsertPosition::After => {
+                    rope.insert(target_end, &payload);
+                    let new_len = payload.len();
+                    delta += new_len as isize;
+                }
+                InsertPosition::At => {
+                    rope.delete(target_start..target_end);
+                    rope.insert(target_start, &payload);
+                    let old_len = target_group.end - target_group.start;
+                    let new_len = payload.len();
+                    delta -= old_len as isize;
+                    delta += new_len as isize;
+                }
+            }
         }
-
         true
     }
 }
