@@ -36,13 +36,9 @@ pub struct Lovely {
 impl Lovely {
     /// Initialize the Lovely patch runtime.
     pub fn init(loadbuffer: &'static LoadBuffer) -> Self {
-        let start = Instant::now();
-
-        let args = std::env::args().skip(1).collect_vec();
-        let mut opts = Options::new(args.iter().map(String::as_str));
-        let cur_exe =
-            env::current_exe().expect("Failed to get the path of the current executable.");
-        let game_name = if env::consts::OS == "macos" {
+    
+        #[cfg(target_os = "macos")]
+        fn get_game_name(cur_exe: PathBuf) -> String{
             cur_exe
                 .parent()
                 .and_then(Path::parent)
@@ -54,13 +50,27 @@ impl Lovely {
                 .strip_suffix(".app")
                 .expect("Parent directory of current executable path was not an .app")
                 .replace(".", "_")
-        } else {
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        fn get_game_name(cur_exe: PathBuf) -> String{
             cur_exe
                 .file_stem()
                 .expect("Failed to get file_stem component of current executable path.")
                 .to_string_lossy()
                 .replace(".", "_")
-        };
+        }
+
+        let start = Instant::now();
+
+        let args = std::env::args().skip(1).collect_vec();
+        let mut opts = Options::new(args.iter().map(String::as_str));
+        let cur_exe =
+            env::current_exe().expect("Failed to get the path of the current executable.");
+
+        
+        let game_name = get_game_name(cur_exe);
+        
         let mut mod_dir = dirs::config_dir().unwrap().join(game_name).join("Mods");
 
         let log_dir = mod_dir.join("lovely").join("log");
